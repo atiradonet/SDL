@@ -53,6 +53,41 @@
 #include <libdecor.h>
 #endif
 
+/* According to the Wayland spec:
+ *
+ * "If the [fullscreen] surface doesn't cover the whole output, the compositor will
+ * position the surface in the center of the output and compensate with border fill
+ * covering the rest of the output. The content of the border fill is undefined, but
+ * should be assumed to be in some way that attempts to blend into the surrounding area
+ * (e.g. solid black)."
+ *
+ * KDE (6.7 at the time of writing) doesn't do this (https://invent.kde.org/plasma/kwin/-/merge_requests/6953),
+ * so fullscreen modes that don't cover the output need to be manually masked.
+ *
+ * This must not be done universally, as some compositors do not correctly honor subsurface
+ * offsets on fullscreen windows, but those also follow the spec regarding automatic masking
+ * around fullscreen windows, so SDL doesn't need to apply its own mask.
+ *
+ * TODO: Remove this once KDE is spec-compliant.
+ */
+static bool ShouldMaskFullscreen()
+{
+    static int mask_required = -1;
+
+    if (mask_required >= 0) {
+        return mask_required != 0;
+    }
+
+    const char *desktop = SDL_getenv("XDG_CURRENT_DESKTOP");
+    if (desktop && SDL_strcmp(desktop, "KDE") == 0) {
+        mask_required = 1;
+    } else {
+        mask_required = 0;
+    }
+
+    return mask_required != 0;
+}
+
 static double GetWindowScale(SDL_Window *window)
 {
     return (window->flags & SDL_WINDOW_HIGH_PIXEL_DENSITY) || window->internal->scale_to_display ? window->internal->scale_factor : 1.0;
@@ -73,20 +108,6 @@ static int PixelToPoint(SDL_Window *window, int pixel)
     return pixel ? SDL_max((int)SDL_lround((double)pixel / GetWindowScale(window)), 1) : 0;
 }
 
-/* According to the Wayland spec:
- *
- * "If the [fullscreen] surface doesn't cover the whole output, the compositor will
- * position the surface in the center of the output and compensate with border fill
- * covering the rest of the output. The content of the border fill is undefined, but
- * should be assumed to be in some way that attempts to blend into the surrounding area
- * (e.g. solid black)."
- *
- * - KDE, as of 5.27, still doesn't do this
- * - GNOME prior to 43 didn't do this (older versions are still found in many LTS distros)
- *
- * Default to 'stretch' for now, until things have moved forward enough that the default
- * can be changed to 'aspect'.
- */
 enum WaylandModeScale
 {
     WAYLAND_MODE_SCALE_UNDEFINED,
@@ -103,15 +124,15 @@ static enum WaylandModeScale GetModeScaleMethod(void)
         const char *scale_hint = SDL_GetHint(SDL_HINT_VIDEO_WAYLAND_MODE_SCALING);
 
         if (scale_hint) {
-            if (!SDL_strcasecmp(scale_hint, "aspect")) {
-                scale_mode = WAYLAND_MODE_SCALE_ASPECT;
+            if (!SDL_strcasecmp(scale_hint, "stretch")) {
+                scale_mode = WAYLAND_MODE_SCALE_STRETCH;
             } else if (!SDL_strcasecmp(scale_hint, "none")) {
                 scale_mode = WAYLAND_MODE_SCALE_NONE;
             } else {
-                scale_mode = WAYLAND_MODE_SCALE_STRETCH;
+                scale_mode = WAYLAND_MODE_SCALE_ASPECT;
             }
         } else {
-            scale_mode = WAYLAND_MODE_SCALE_STRETCH;
+            scale_mode = WAYLAND_MODE_SCALE_ASPECT;
         }
     }
 
@@ -479,9 +500,9 @@ static void ConfigureWindowGeometry(SDL_Window *window)
     }
 
     /* Calculate the mask size and offset.
-     * Fullscreen windows are centered and masked automatically by the compositor.
+     * Fullscreen windows are centered and masked automatically by the compositor, unless it lacks the capability.
      */
-    if (data->viewport && data->waylandData->subcompositor && !data->is_fullscreen &&
+    if (data->viewport && data->waylandData->subcompositor && (!data->is_fullscreen || ShouldMaskFullscreen()) &&
         (viewport_width != data->current.logical_width || viewport_height != data->current.logical_height)) {
         struct wl_buffer *old_buffer = NULL;
 
@@ -870,10 +891,10 @@ static void handle_xdg_surface_configure(void *data, struct xdg_surface *xdg, ui
         wind->pending_config_ack = false;
         ConfigureWindowGeometry(window);
         xdg_surface_ack_configure(xdg, serial);
-    } else {
+    } else if (!wind->pending_config_ack) {
         wind->pending_config_ack = true;
 
-        // Send an exposure event so that clients doing deferred updates will trigger a frame callback and make guaranteed forward progress when resizing.
+        // Always send an exposure event during a new frame to ensure forward progress if the frame callback already occurred.
         SDL_SendWindowEvent(window, SDL_EVENT_WINDOW_EXPOSED, 0, 0);
     }
 
@@ -1643,6 +1664,11 @@ static void decoration_frame_configure(struct libdecor_frame *frame,
         struct libdecor_state *state = libdecor_state_new(wind->current.logical_width, wind->current.logical_height);
         libdecor_frame_commit(frame, state, configuration);
         libdecor_state_free(state);
+
+        // Always send an exposure event during a new frame to ensure forward progress if the frame callback already occurred.
+        if (started_resize) {
+            SDL_SendWindowEvent(window, SDL_EVENT_WINDOW_EXPOSED, 0, 0);
+        }
     }
 
     if (wind->shell_surface_status == WAYLAND_SHELL_SURFACE_STATUS_WAITING_FOR_CONFIGURE) {
@@ -2273,7 +2299,7 @@ void Wayland_ShowWindow(SDL_VideoDevice *_this, SDL_Window *window)
         wl_surface_commit(data->surface);
     }
 
-    // Make sure the window can't be resized to 0 or it can be spuriously closed by the window manager.
+    // Make sure the window can't be resized to 0, or it can be spuriously closed by the window manager.
     data->system_limits.min_width = SDL_max(data->system_limits.min_width, 1);
     data->system_limits.min_height = SDL_max(data->system_limits.min_height, 1);
 
@@ -2316,6 +2342,13 @@ void Wayland_ShowWindow(SDL_VideoDevice *_this, SDL_Window *window)
         }
     }
 
+    // No frame callback on an external surface, as it may already have one attached.
+    if (!(window->flags & SDL_WINDOW_EXTERNAL)) {
+        // Fire a callback when the compositor wants a new frame.
+        data->surface_frame_callback = wl_surface_frame(data->surface);
+        wl_callback_add_listener(data->surface_frame_callback, &surface_frame_listener, data);
+    }
+
     data->show_hide_sync_required = true;
     struct wl_callback *cb = wl_display_sync(_this->internal->display);
     wl_callback_add_listener(cb, &show_hide_sync_listener, (void *)((uintptr_t)window->id));
@@ -2325,9 +2358,7 @@ void Wayland_ShowWindow(SDL_VideoDevice *_this, SDL_Window *window)
     data->showing_window = false;
 
     // Send an exposure event to signal that the client should draw.
-    if (data->shell_surface_status == WAYLAND_SHELL_SURFACE_STATUS_WAITING_FOR_FRAME) {
-        SDL_SendWindowEvent(window, SDL_EVENT_WINDOW_EXPOSED, 0, 0);
-    }
+    SDL_SendWindowEvent(window, SDL_EVENT_WINDOW_EXPOSED, 0, 0);
 }
 
 static void Wayland_ReleasePopup(SDL_VideoDevice *_this, SDL_Window *popup)
@@ -2383,6 +2414,11 @@ void Wayland_HideWindow(SDL_VideoDevice *_this, SDL_Window *window)
     }
 
     wind->shell_surface_status = WAYLAND_SHELL_SURFACE_STATUS_HIDDEN;
+
+    if (wind->surface_frame_callback) {
+        wl_callback_destroy(wind->surface_frame_callback);
+        wind->surface_frame_callback = NULL;
+    }
 
     if (wind->server_decoration) {
         zxdg_toplevel_decoration_v1_destroy(wind->server_decoration);
@@ -2960,13 +2996,6 @@ bool Wayland_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_Proper
         WAYLAND_wl_proxy_set_queue((struct wl_proxy *)data->gles_swap_frame_surface_wrapper, data->gles_swap_frame_event_queue);
         data->gles_swap_frame_callback = wl_surface_frame(data->gles_swap_frame_surface_wrapper);
         wl_callback_add_listener(data->gles_swap_frame_callback, &gles_swap_frame_listener, data);
-    }
-
-    // No frame callback on external surfaces as it may already have one attached.
-    if (!external_surface) {
-        // Fire a callback when the compositor wants a new frame to set the surface damage region.
-        data->surface_frame_callback = wl_surface_frame(data->surface);
-        wl_callback_add_listener(data->surface_frame_callback, &surface_frame_listener, data);
     }
 
     if (window->flags & SDL_WINDOW_TRANSPARENT) {
@@ -3558,10 +3587,6 @@ void Wayland_DestroyWindow(SDL_VideoDevice *_this, SDL_Window *window)
             wl_callback_destroy(wind->gles_swap_frame_callback);
             WAYLAND_wl_proxy_wrapper_destroy(wind->gles_swap_frame_surface_wrapper);
             WAYLAND_wl_event_queue_destroy(wind->gles_swap_frame_event_queue);
-        }
-
-        if (wind->surface_frame_callback) {
-            wl_callback_destroy(wind->surface_frame_callback);
         }
 
         if (!(window->flags & SDL_WINDOW_EXTERNAL)) {
